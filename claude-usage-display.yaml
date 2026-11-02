@@ -1,0 +1,252 @@
+# ESPHome firmware for the DustinWatts ESP32_TFT_Combiner board (480x320
+# landscape, ILI9488_A rotated 270°) showing Claude.ai usage limits on a
+# single screen. The custom `claude_usage` component (external_components/claude_usage)
+# talks to Anthropic directly - no Home Assistant integration, no Mac server.
+#
+# First boot: the screen shows a sign-in prompt. Open the device's web page
+# (http://<ip>/), copy the "Claude Auth URL" into a browser, approve, then
+# paste the code Anthropic shows into the "Claude Auth Code" box. The refresh
+# token is stored in flash; after that it runs unattended.
+#
+# Secrets needed: wifi_ssid, wifi_password, ap_password
+
+esphome:
+  name: claude-usage-display
+  friendly_name: Claude Usage Display
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Claude Usage Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+logger:
+  level: debug
+
+api:
+
+ota:
+  - platform: esphome
+
+web_server:
+  port: 80
+  version: 3
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: UTC   # set yours, e.g. America/New_York; drives reset clock times
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+
+external_components:
+  - source:
+      type: local
+      path: external_components
+
+http_request:
+  useragent: esphome-claude-usage
+  timeout: 15s
+  watchdog_timeout: 30s
+
+claude_usage:
+  id: cu
+  update_interval: 5min
+  session_percent:
+    id: session_pct
+    name: "Session Usage"
+  weekly_percent:
+    id: weekly_pct
+    name: "Weekly Usage"
+  session_reset:
+    id: session_reset
+    name: "Session Resets In"
+  weekly_reset:
+    id: weekly_reset
+    name: "Weekly Resets"
+  plan:
+    id: plan
+    name: "Plan"
+  status:
+    id: cu_status
+    name: "Claude Status"
+  auth_url:
+    id: auth_url
+    name: "Claude Auth URL"
+
+# Paste the code from Anthropic's approval page here (web page or HA).
+text:
+  - platform: template
+    name: "Claude Auth Code"
+    id: auth_code
+    mode: text
+    optimistic: true
+    min_length: 0
+    max_length: 255
+    set_action:
+      - lambda: id(cu).submit_code(x);
+
+button:
+  - platform: template
+    name: "Claude Sign Out"
+    on_press:
+      - lambda: id(cu).sign_out();
+
+# --- SPI bus shared by display + touch ---
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+# --- Backlight ---
+output:
+  - platform: ledc
+    pin: GPIO32
+    id: backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: backlight
+    restore_mode: ALWAYS_ON
+
+# --- Touch (wired, unused) ---
+touchscreen:
+  platform: xpt2046
+  id: touch
+  cs_pin: GPIO21
+  update_interval: 50ms
+  threshold: 350
+  calibration:
+    x_min: 280
+    x_max: 3806
+    y_min: 185
+    y_max: 3884
+
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: font_big
+    size: 30
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: font_med
+    size: 20
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: font_small
+    size: 14
+
+display:
+  - platform: mipi_spi
+    model: ILI9488_A
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    reset_pin: GPIO4
+    rotation: 270
+    update_interval: 5s
+    lambda: |-
+      it.fill(Color(0, 0, 0));
+
+      // Header
+      it.printf(16, 4, id(font_big), Color(255, 255, 255), TextAlign::TOP_LEFT, "CLAUDE");
+      if (id(plan).has_state())
+        it.printf(464, 12, id(font_med), Color(150, 150, 150), TextAlign::TOP_RIGHT, "%s", id(plan).state.c_str());
+      it.line(16, 44, 464, 44, Color(70, 70, 70));
+
+      bool have_data = id(session_pct).has_state() && !std::isnan(id(session_pct).state);
+      if (!have_data) {
+        // Not signed in yet (or first fetch pending): say what to do.
+        std::string st = id(cu_status).has_state() ? id(cu_status).state : "Starting...";
+        it.printf(240, 90, id(font_med), Color(255, 180, 60), TextAlign::TOP_CENTER, "%s", st.c_str());
+        if (st.rfind("Sign-in", 0) == 0 || st.rfind("Code", 0) == 0) {
+          it.printf(240, 140, id(font_small), Color(200, 200, 200), TextAlign::TOP_CENTER, "Open in a browser:");
+          it.printf(240, 160, id(font_med), Color(255, 255, 255), TextAlign::TOP_CENTER, "http://%s/", id(wifi_ip).state.c_str());
+          it.printf(240, 200, id(font_small), Color(150, 150, 150), TextAlign::TOP_CENTER, "Open the Claude Auth URL, approve,");
+          it.printf(240, 220, id(font_small), Color(150, 150, 150), TextAlign::TOP_CENTER, "then paste the code into Claude Auth Code.");
+        }
+        return;
+      }
+
+      // One usage block: label, big %, coloured bar, detail line.
+      // Green < 60%, amber < 85%, red above. Unavailable shows "--".
+      auto block = [&](int y, const char *label, Color accent, sensor::Sensor *s,
+                       const std::string &detail) {
+        bool ok = s->has_state() && !std::isnan(s->state);
+        float pct = ok ? s->state : 0;
+        Color bar = pct < 60 ? Color(80, 200, 120)
+                  : pct < 85 ? Color(255, 180, 60)
+                             : Color(255, 90, 90);
+        it.printf(16, y + 2, id(font_med), accent, TextAlign::TOP_LEFT, "%s", label);
+        if (ok) {
+          it.printf(464, y - 2, id(font_big), Color(255, 255, 255), TextAlign::TOP_RIGHT, "%.0f%%", pct);
+        } else {
+          it.printf(464, y + 2, id(font_med), Color(90, 90, 90), TextAlign::TOP_RIGHT, "--");
+        }
+        it.rectangle(16, y + 38, 448, 14, Color(70, 70, 70));
+        int w = (int) (pct > 100 ? 100 : pct) * 444 / 100;
+        if (w > 0) it.filled_rectangle(18, y + 40, w, 10, bar);
+        it.printf(16, y + 58, id(font_small), Color(150, 150, 150), TextAlign::TOP_LEFT, "%s", detail.c_str());
+      };
+
+      std::string d1 = id(session_reset).has_state() && !id(session_reset).state.empty()
+                           ? "resets in " + id(session_reset).state : "";
+      block(52, "Session (5h)", Color(255, 180, 60), id(session_pct), d1);
+
+      it.line(16, 136, 464, 136, Color(40, 40, 40));
+      std::string d2 = id(weekly_reset).has_state() && !id(weekly_reset).state.empty()
+                           ? "resets " + id(weekly_reset).state : "";
+      block(142, "Weekly (7d)", Color(90, 140, 255), id(weekly_pct), d2);
+
+      it.line(16, 226, 464, 226, Color(40, 40, 40));
+
+      // Weekly usage by source: stacked bar + legend (shares of the 7d total).
+      it.printf(16, 234, id(font_med), Color(190, 130, 255), TextAlign::TOP_LEFT, "Weekly by source");
+      const auto &rows = id(cu)->breakdown();
+      float total = 0;
+      for (const auto &r : rows) total += r.percent;
+      if (total > 0) {
+        Color pal[4] = {Color(217, 119, 87), Color(90, 140, 255), Color(80, 200, 120), Color(150, 150, 150)};
+        it.rectangle(16, 270, 448, 14, Color(70, 70, 70));
+        float cum = 0;
+        int lx = 16, i = 0;
+        for (const auto &r : rows) {
+          Color c = pal[i++ % 4];
+          if (r.percent <= 0) continue;
+          int x0 = 18 + (int) (cum * 444 / total);
+          cum += r.percent;
+          int x1 = 18 + (int) (cum * 444 / total);
+          it.filled_rectangle(x0, 272, x1 - x0, 10, c);
+          char t[48];
+          snprintf(t, sizeof t, "%s %.0f%%", r.name.c_str(), r.percent);
+          int bx, by, bw, bh;
+          it.get_text_bounds(lx + 12, 292, t, id(font_small), TextAlign::TOP_LEFT, &bx, &by, &bw, &bh);
+          it.filled_rectangle(lx, 296, 8, 8, c);
+          it.printf(lx + 12, 292, id(font_small), Color(200, 200, 200), TextAlign::TOP_LEFT, "%s", t);
+          lx += bw + 28;
+        }
+      } else {
+        it.printf(16, 270, id(font_small), Color(150, 150, 150), TextAlign::TOP_LEFT, "no breakdown available");
+      }
+
+      // Surface problems (rate limit, auth) without hiding the last good data.
+      if (id(cu_status).has_state() && id(cu_status).state != "OK" && id(cu_status).state != "Signed in")
+        it.printf(464, 4, id(font_small), Color(255, 90, 90), TextAlign::TOP_RIGHT, "%s", id(cu_status).state.c_str());
